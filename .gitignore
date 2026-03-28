@@ -1,0 +1,7 @@
+*.pth
+experiments/
+results/
+__pycache__/
+*.pyc
+weights/
+datasets/
