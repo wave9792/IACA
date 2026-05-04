@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -16,6 +17,7 @@ import torch.nn.functional as F
 from KUPCP_dataset import CompositionDataset
 from TAD66K_dataset import ThemeDataset
 from Cropping_dataset import FCDBDataset
+from GAICD_dataset import GAICDRankingDataset
 from config_cropping import cfg
 from test import evaluate_on_FCDB_and_FLMS
 from CACNet import CACNet
@@ -82,7 +84,21 @@ def create_dataloader():
         len(theme_dataset), cfg.theme_batch_size, len(theme_loader)
     ))
 
-    return crop_loader, com_loader, theme_loader
+    # 新增：GAICD ranking 数据加载器  (batch_size=2: 两张图各提供一对 good/bad crop)
+    gaic_rank_dataset = GAICDRankingDataset(split='train', keep_aspect_ratio=cfg.keep_aspect_ratio)
+    gaic_rank_loader = torch.utils.data.DataLoader(
+        gaic_rank_dataset,
+        batch_size=cfg.rank_batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        drop_last=False,
+        worker_init_fn=seed_worker
+    )
+    print('GAICD Ranking training set has {} samples, batch_size={}, total {} batches'.format(
+        len(gaic_rank_dataset), cfg.rank_batch_size, len(gaic_rank_loader)
+    ))
+
+    return crop_loader, com_loader, theme_loader, gaic_rank_loader
 
 
 class Trainer:
@@ -95,9 +111,10 @@ class Trainer:
         self.optimizer, self.lr_scheduler = self.get_optimizer()
         self.scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
-        self.crop_loader, self.com_loader, self.theme_loader = create_dataloader()
+        self.crop_loader, self.com_loader, self.theme_loader, self.gaic_rank_loader = create_dataloader()
         self.com_dataiter = iter(self.com_loader)
         self.theme_dataiter = iter(self.theme_loader)
+        self.gaic_rank_dataiter = iter(self.gaic_rank_loader)
 
         self.eval_results = []
         self.best_results = {
@@ -112,10 +129,16 @@ class Trainer:
         self.theme_criterion = nn.CrossEntropyLoss()
         self.contrastive_loss_fn = NTXentLoss(temperature=0.5)
 
+        # 新增：ranking loss (margin ranking) 和区域对比损失
+        self.ranking_criterion = nn.MarginRankingLoss(margin=cfg.ranking_margin)
+        self.region_contrastive_loss_fn = RegionContrastiveLoss(temperature=0.5)
+
         self.crop_weight = cfg.crop_loss_factor
         self.com_weight = cfg.com_loss_factor
         self.theme_weight = cfg.theme_loss_factor
         self.contrastive_weight = cfg.contrastive_loss_weight
+        self.ranking_weight = cfg.ranking_loss_weight
+        self.region_contrastive_weight = cfg.region_contrastive_loss_weight
 
     def get_optimizer(self):
         optimizer = torch.optim.AdamW(
@@ -147,6 +170,14 @@ class Trainer:
                 batch = next(self.theme_dataiter)
             return batch
 
+        if loader_name == 'gaic_ranking':
+            try:
+                batch = next(self.gaic_rank_dataiter)
+            except StopIteration:
+                self.gaic_rank_dataiter = iter(self.gaic_rank_loader)
+                batch = next(self.gaic_rank_dataiter)
+            return batch
+
         raise ValueError(f'Unsupported loader name: {loader_name}')
 
     @staticmethod
@@ -157,7 +188,10 @@ class Trainer:
         return labels.long()
 
     def run(self):
-        print('======== Begin Multi-task Training (Cropping + Composition + Theme + Contrastive) ========')
+        print('=' * 60)
+        print('Multi-task Training: Cropping + Composition + Theme')
+        print('               + Contrastive (global) + Contrastive (region) + GAICD Ranking')
+        print('=' * 60)
         for epoch in range(1, self.max_epoch + 1):
             self.epoch = epoch
             self.train()
@@ -174,6 +208,8 @@ class Trainer:
         batch_com_loss = 0.0
         batch_theme_loss = 0.0
         batch_contrastive_loss = 0.0
+        batch_ranking_loss = 0.0
+        batch_region_con_loss = 0.0
         batch_total_loss = 0.0
 
         total_batch = len(self.crop_loader)
@@ -181,6 +217,7 @@ class Trainer:
         for batch_idx, batch_data in enumerate(self.crop_loader):
             self.iters += 1
 
+            # ---- FCDB cropping data ----
             view1 = batch_data[0].to(device, non_blocking=True)
             view2 = batch_data[1].to(device, non_blocking=True)
             crop = batch_data[2].to(device, non_blocking=True).squeeze(1)
@@ -190,8 +227,10 @@ class Trainer:
             crop[:, 0::2] = crop[:, 0::2] / width[:, None] * view1.shape[-1]
             crop[:, 1::2] = crop[:, 1::2] / height[:, None] * view1.shape[-2]
 
+            # ---- Auxiliary task data ----
             com_batch = self._next_aux_batch('composition')
             theme_batch = self._next_aux_batch('theme')
+            gaic_batch = self._next_aux_batch('gaic_ranking')
 
             com_im = com_batch[0].to(device, non_blocking=True)
             com_label = self._prepare_labels(com_batch[1])
@@ -199,38 +238,90 @@ class Trainer:
             theme_im = theme_batch[0].to(device, non_blocking=True)
             theme_label = self._prepare_labels(theme_batch[1])
 
+            # GAICD ranking data
+            gaic_im = gaic_batch[0].to(device, non_blocking=True)
+            gaic_good_crop = gaic_batch[1].to(device, non_blocking=True)  # (B, 4)
+            gaic_bad_crop = gaic_batch[2].to(device, non_blocking=True)   # (B, 4)
+            gaic_im_width = gaic_batch[5].to(device, non_blocking=True)
+            gaic_im_height = gaic_batch[6].to(device, non_blocking=True)
+
             self.optimizer.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                # 共享 backbone，避免 view1 重复前向
+                # ---- Shared feature extraction ----
                 feat_view1 = self.model.extract_features(view1)
                 feat_view2 = self.model.extract_features(view2)
                 feat_com = self.model.extract_features(com_im)
                 feat_theme = self.model.extract_features(theme_im)
+                feat_gaic = self.model.extract_features(gaic_im)
 
-                # 对比学习
+                # ---- 1) 全局对比学习 ----
                 embedding1 = self.model.forward_from_features(feat_view1, operation='embedding')
                 embedding2 = self.model.forward_from_features(feat_view2, operation='embedding')
                 contrastive_loss = self.contrastive_loss_fn(embedding1, embedding2)
 
-                # 裁剪
+                # ---- 2) 裁剪预测 ----
                 _, _, pre_crop = self.model.forward_from_features(feat_view1, operation='cropping')
                 crop_loss = self.crop_criterion(pre_crop, crop)
 
-                # 构图
+                # ---- 3) 构图分类 ----
                 logits_com, _ = self.model.forward_from_features(feat_com, operation='composition')
                 com_loss = self.com_criterion(logits_com, com_label)
 
-                # 主题
+                # ---- 4) 主题分类 ----
                 logits_theme, _ = self.model.forward_from_features(feat_theme, operation='theme')
                 theme_loss = self.theme_criterion(logits_theme, theme_label)
 
-                # 总损失
+                # ---- 5) GAICD Ranking Loss ----
+                # Map GAICD crop boxes from original coords to feature map coords
+                B_gaic = gaic_im.shape[0]
+
+                good_boxes_list = [gaic_good_crop[i:i+1] for i in range(B_gaic)]
+                bad_boxes_list = [gaic_bad_crop[i:i+1] for i in range(B_gaic)]
+
+                score_good, score_bad = self.model.forward_ranking(
+                    feat_gaic, good_boxes_list, bad_boxes_list,
+                    gaic_im_width, gaic_im_height
+                )
+
+                target_ones = torch.ones_like(score_good)
+                ranking_loss = self.ranking_criterion(score_good, score_bad, target_ones)
+
+                # ---- 6) 区域级对比学习 ----
+                # 对 view1 的 GT crop 区域 和 GAICD 的 good/bad crop 区域做对比
+                gt_boxes = []
+                fcdb_width = batch_data[3].to(device)
+                fcdb_height = batch_data[4].to(device)
+                gt_raw = batch_data[2].to(device).squeeze(1)  # (B, 4) original coords
+
+                for i in range(view1.shape[0]):
+                    gt_boxes.append(gt_raw[i:i+1])
+
+                # 提取 GT crop 区域嵌入
+                gt_embeddings = self.model.forward_region_embedding(
+                    feat_view1, gt_boxes, fcdb_width, fcdb_height
+                )  # (B, 128)
+
+                # 提取 GAICD good/bad crop 区域嵌入
+                good_embeddings = self.model.forward_region_embedding(
+                    feat_gaic, good_boxes_list, gaic_im_width, gaic_im_height
+                )  # (B, 128)
+                bad_embeddings = self.model.forward_region_embedding(
+                    feat_gaic, bad_boxes_list, gaic_im_width, gaic_im_height
+                )  # (B, 128)
+
+                region_con_loss = self.region_contrastive_loss_fn(
+                    gt_embeddings, good_embeddings, bad_embeddings
+                )
+
+                # ---- Total Loss ----
                 total_loss = (
                     self.crop_weight * crop_loss +
                     self.com_weight * com_loss +
                     self.theme_weight * theme_loss +
-                    self.contrastive_weight * contrastive_loss
+                    self.contrastive_weight * contrastive_loss +
+                    self.ranking_weight * ranking_loss +
+                    self.region_contrastive_weight * region_con_loss
                 )
 
             self.scaler.scale(total_loss).backward()
@@ -243,6 +334,8 @@ class Trainer:
             batch_com_loss += com_loss.item()
             batch_theme_loss += theme_loss.item()
             batch_contrastive_loss += contrastive_loss.item()
+            batch_ranking_loss += ranking_loss.item()
+            batch_region_con_loss += region_con_loss.item()
             batch_total_loss += total_loss.item()
 
             if batch_idx > 0 and batch_idx % cfg.display_freq == 0:
@@ -250,6 +343,8 @@ class Trainer:
                 avg_com_loss = batch_com_loss / (batch_idx + 1)
                 avg_theme_loss = batch_theme_loss / (batch_idx + 1)
                 avg_contrastive_loss = batch_contrastive_loss / (batch_idx + 1)
+                avg_ranking_loss = batch_ranking_loss / (batch_idx + 1)
+                avg_region_con_loss = batch_region_con_loss / (batch_idx + 1)
                 avg_total_loss = batch_total_loss / (batch_idx + 1)
                 cur_lr = self.optimizer.param_groups[0]['lr']
 
@@ -257,6 +352,8 @@ class Trainer:
                 self.writer.add_scalar('train/composition_loss', avg_com_loss, self.iters)
                 self.writer.add_scalar('train/theme_loss', avg_theme_loss, self.iters)
                 self.writer.add_scalar('train/contrastive_loss', avg_contrastive_loss, self.iters)
+                self.writer.add_scalar('train/ranking_loss', avg_ranking_loss, self.iters)
+                self.writer.add_scalar('train/region_contrastive_loss', avg_region_con_loss, self.iters)
                 self.writer.add_scalar('train/total_loss', avg_total_loss, self.iters)
                 self.writer.add_scalar('train/lr', cur_lr, self.iters)
 
@@ -272,6 +369,8 @@ class Trainer:
                     f'Comp:{avg_com_loss:.4f} | '
                     f'Theme:{avg_theme_loss:.4f} | '
                     f'Contrast:{avg_contrastive_loss:.4f} | '
+                    f'Rank:{avg_ranking_loss:.4f} | '
+                    f'RegCon:{avg_region_con_loss:.4f} | '
                     f'Total:{avg_total_loss:.4f} | '
                     f'lr:{cur_lr:.6f} | '
                     f'estimated last time:{time_str} ==='
@@ -348,7 +447,12 @@ class Trainer:
         print('Save result to', csv_path)
 
 
+# ============================================================================
+# Loss Functions
+# ============================================================================
+
 class NTXentLoss(nn.Module):
+    """Standard NT-Xent loss for global contrastive learning (SimCLR-style)."""
     def __init__(self, temperature=0.5):
         super().__init__()
         self.temperature = temperature
@@ -360,7 +464,6 @@ class NTXentLoss(nn.Module):
         z_j = F.normalize(z_j, dim=1)
         z = torch.cat([z_i, z_j], dim=0)
 
-        # 相似度矩阵强制 float32，更稳
         sim_matrix = torch.matmul(z.float(), z.float().T) / self.temperature
         mask = torch.eye(2 * batch_size, dtype=torch.bool, device=z.device)
         sim_matrix = sim_matrix.masked_fill(mask, float('-inf'))
@@ -372,6 +475,73 @@ class NTXentLoss(nn.Module):
 
         return F.cross_entropy(sim_matrix, positive_indices)
 
+
+class RegionContrastiveLoss(nn.Module):
+    """Region-level contrastive loss.
+
+    Treats GT crop + good GAICD crops as positives,
+    bad GAICD crops as negatives within each image.
+    """
+    def __init__(self, temperature=0.5):
+        super().__init__()
+        self.temperature = temperature
+
+    def forward(self, gt_embeddings, good_embeddings, bad_embeddings):
+        """Args:
+            gt_embeddings:    (B, D)  GT crop region embeddings
+            good_embeddings:  (B, D)  high-score GAICD crop region embeddings
+            bad_embeddings:   (B, D)  low-score GAICD crop region embeddings
+
+        Returns:
+            scalar loss
+        """
+        B, D = gt_embeddings.shape
+
+        # Normalize
+        gt = F.normalize(gt_embeddings, dim=1)
+        good = F.normalize(good_embeddings, dim=1)
+        bad = F.normalize(bad_embeddings, dim=1)
+
+        # Stack: [gt_1, ..., gt_B, good_1, ..., good_B, bad_1, ..., bad_B]
+        all_emb = torch.cat([gt, good, bad], dim=0)  # (3B, D)
+
+        sim_matrix = torch.matmul(all_emb.float(), all_emb.float().T) / self.temperature
+
+        # Build positive mask: gt_i ↔ good_i
+        pos_mask = torch.zeros(3 * B, 3 * B, dtype=torch.bool, device=all_emb.device)
+        for i in range(B):
+            pos_mask[i, B + i] = True       # gt_i ↔ good_i
+            pos_mask[B + i, i] = True       # good_i ↔ gt_i
+
+        # Mask self-pairs
+        diag_mask = torch.eye(3 * B, dtype=torch.bool, device=all_emb.device)
+        pos_mask = pos_mask & ~diag_mask
+
+        # Compute InfoNCE-style loss per anchor
+        sim_matrix = sim_matrix.masked_fill(diag_mask, float('-inf'))
+
+        loss = 0.0
+        count = 0
+        for i in range(B):
+            # Anchor = gt_i, positives = [good_i], negatives = everything else
+            if pos_mask[i].sum() > 0:
+                pos_sim = sim_matrix[i][pos_mask[i]]
+                # log-sum-exp over all candidates (excluding self)
+                all_sim = sim_matrix[i]  # includes negatives
+                denominator = torch.logsumexp(all_sim, dim=0)
+                numerator = pos_sim.mean()
+                loss += -numerator + denominator
+                count += 1
+
+        if count == 0:
+            return torch.tensor(0.0, device=all_emb.device, requires_grad=True)
+
+        return loss / count
+
+
+# ============================================================================
+# Main
+# ============================================================================
 
 if __name__ == '__main__':
     cfg.create_path()

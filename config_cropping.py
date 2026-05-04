@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 from paths import (
     DATA_ROOT, EXPERIMENTS_ROOT,
@@ -20,27 +21,35 @@ class Config:
     gpu_id = 0
 
     # ===== 4G 冒烟测试 =====
-    crop_batch_size = 1
-    com_batch_size = 1
-    theme_batch_size = 1
-    num_workers = 0
-    display_freq = 1
-    max_epoch = 1
-    eval_freq = 1000
+    # crop_batch_size = 1
+    # com_batch_size = 1
+    # theme_batch_size = 1
+    # rank_batch_size = 1
+    # num_workers = 0
+    # display_freq = 1
+    # max_epoch = 1
+    # eval_freq = 1000
 
     # ===== 16G 正式训练 =====
-    # crop_batch_size = 2
-    # com_batch_size = 4
-    # theme_batch_size = 4
-    # num_workers = 4
-    # display_freq = 20
-    # max_epoch = 100
-    # eval_freq = 1
+    crop_batch_size = 8
+    com_batch_size = 4
+    theme_batch_size = 4
+    rank_batch_size = 2
+    num_workers = 4
+    display_freq = 20
+    max_epoch = 100
+    eval_freq = 1
 
+    # ---- Loss weights ----
     crop_loss_factor = 0.6
     com_loss_factor = 0.2
     theme_loss_factor = 0.2
     contrastive_loss_weight = 0.2
+
+    # 新增：GAICD ranking loss + 区域对比损失权重
+    ranking_loss_weight = 0.15
+    region_contrastive_loss_weight = 0.15
+    ranking_margin = 0.5
 
     lr_decay_epoch = [30, 60]
     lr = 1e-4
@@ -49,8 +58,9 @@ class Config:
     save_freq = max_epoch + 1
     save_image_freq = 200
 
-    prefix = 'cropping_{}croploss_{}compositionloss_{}themeloss_{}contrastive'.format(
-        crop_loss_factor, com_loss_factor, theme_loss_factor, contrastive_loss_weight
+    prefix = 'cropping_{}croploss_{}compositionloss_{}themeloss_{}contrastive_{}ranking_{}regioncon'.format(
+        crop_loss_factor, com_loss_factor, theme_loss_factor,
+        contrastive_loss_weight, ranking_loss_weight, region_contrastive_loss_weight
     )
 
     exp_root = str(EXPERIMENTS_ROOT)
